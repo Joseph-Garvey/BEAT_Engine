@@ -1,9 +1,10 @@
-# Sweep pipelining for compiled-system solves
+# Coupled solves: CPU/GPU split and sweep pipelining
 
-Status: exterior-only planned; coupled not worth implementing for FEM-heavy
-projects (measured below). This branch is where it gets attempted, as its own PR
-after the Metal backend PRs (JWSound/BEAT_Engine#1, #2), to keep those
-reviewable.
+Status: parked until the Metal backend PRs (JWSound/BEAT_Engine#1, #2) are in.
+This branch holds the coupled work as its own PR: splitting coupled work between
+CPU and GPU by per-hardware calibration (including the real-equivalent GPU
+factorisation), and testing whether coupled sweep pipelining ever pays.
+Pipelining for exterior-only system solves moved to JWSound/BEAT_Engine#1.
 
 ## The gap
 
@@ -64,15 +65,13 @@ pipeline only when `G > S`. No calibration constants needed.
 
 ## Plan
 
-1. Exterior-only system solves. The loop has the driver's shape (Metal
-   assembles, host solves), so the gain is real on every machine above some
-   size. Reuse `start_sweep_assembly_pipeline`, the memory-derived depth and
-   `validate_metal_sweep_pipeline.jl`. Take the on/off decision from a
-   calibration (GPU assembly vs host solve throughput, env-overridable, like
-   the dense-solve cost model and `scripts/calibrate_dense_solve.jl`) rather
-   than the fixed `METAL_PIPELINE_MIN_DOFS = 1900` measured on one machine.
-2. Coupled solves. Not implemented unless a representative FEM-light project
-   shows `G > S`. Then: the per-sweep decision above.
+1. Measure a FEM-light coupled project. Implement cross-frequency pipelining
+   only if it shows `G > S`, with the per-sweep decision above.
+2. CPU/GPU split of the host-bound stages (Schur extraction, coupled
+   factorization), assigned by per-hardware calibration as the dense-solve cost
+   model does. The real-equivalent GPU factorisation was measured as needing
+   the GPU to be over 2x faster to pay; recalibrate on larger GPUs before
+   deciding.
 
-Either change only reorders work, so results must stay bit-identical to the
-sequential path; the pipeline gate checks that.
+Benchmark per docs/Benchmarking.md. Reordering work must leave results
+bit-identical to the sequential path.
