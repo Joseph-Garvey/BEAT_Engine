@@ -348,18 +348,27 @@ function _condensed_quadrature_bundle(
     order::Int;
     singular_order::Int,
     symmetry_mode::Symbol,
+    bem_backend::Symbol=:cpu,
 ) where {T<:AbstractFloat}
     rule = triangle_rule(T, order)
 
     assembly_started = time_ns()
-    cpu_assembly_cache = build_beat_cpu_assembly_cache(
+    cpu_assembly_cache = bem_backend == :cpu ? build_beat_cpu_assembly_cache(
         bem_mesh,
         p1,
         dp0,
         rule;
         singular_order=singular_order,
         symmetry_mode=symmetry_mode,
-    )
+    ) : nothing
+    device_cache = bem_backend == :metal ? build_metal_regular_assembly_cache(
+        bem_mesh,
+        p1,
+        dp0,
+        rule;
+        singular_order=singular_order,
+        symmetry_mode=symmetry_mode,
+    ) : nothing
     bem_cpu_assembly_cache_s = (time_ns() - assembly_started) / 1.0e9
 
     identity_started = time_ns()
@@ -379,13 +388,16 @@ function _condensed_quadrature_bundle(
     bem_identity_cache_s = (time_ns() - identity_started) / 1.0e9
 
     field_started = time_ns()
-    field_cache = build_field_evaluation_cache(bem_mesh, rule; symmetry_mode=symmetry_mode)
+    cpu_field_cache = build_field_evaluation_cache(bem_mesh, rule; symmetry_mode=symmetry_mode)
+    field_cache = bem_backend == :metal ?
+                  build_metal_field_evaluation_cache(cpu_field_cache) : cpu_field_cache
     field_cache_s = (time_ns() - field_started) / 1.0e9
 
     return (
         order=order,
         rule=rule,
         cpu_assembly_cache=cpu_assembly_cache,
+        device_cache=device_cache,
         identity_p1_p1=identity_p1_p1,
         identity_p1_dp0=identity_p1_dp0,
         field_cache=field_cache,
@@ -419,14 +431,19 @@ function prepare_condensed_coupled_cache(
     retained_fem_vertices=interface_map.fem_vertex_indices,
     bulk_loss_factor_by_vertex=zeros(T, length(fem_mesh.vertices)),
     wall_impedances=NamedTuple[],
+    bem_backend::Symbol=:cpu,
 ) where {T<:AbstractFloat}
+    # The condensed solver's linear algebra is CPU-only; the BEM operators may
+    # come from the CPU or from Metal, which hands them back as host matrices.
+    bem_backend in (:cpu, :metal) ||
+        error("Condensed coupled BEM backend must be :cpu or :metal; got $bem_backend.")
     base = prepare_coupled_cache(
         fem_mesh,
         bem_mesh,
         interface_map;
         quadrature_order=quadrature_order,
         singular_order=singular_order,
-        bem_backend=:cpu,
+        bem_backend=bem_backend,
         symmetry_mode=symmetry_mode,
         retained_fem_vertices=retained_fem_vertices,
         bulk_loss_factor_by_vertex=bulk_loss_factor_by_vertex,
@@ -449,6 +466,7 @@ function prepare_condensed_coupled_cache(
         order=quadrature_order,
         rule=base.rule,
         cpu_assembly_cache=base.cpu_assembly_cache,
+        device_cache=base.device_cache,
         identity_p1_p1=base.identity_p1_p1,
         identity_p1_dp0=base.identity_p1_dp0,
         field_cache=base.field_cache,
@@ -462,6 +480,7 @@ function prepare_condensed_coupled_cache(
             order;
             singular_order=singular_order,
             symmetry_mode=base.symmetry_mode,
+            bem_backend=bem_backend,
         )
     end
     # Extra bundles are real setup cost, so fold them into the fields the caller already reports
@@ -489,10 +508,49 @@ function prepare_condensed_coupled_cache(
 end
 
 function release_condensed_coupled_cache!(cache)
-    # CPU only, so the bundles hold host memory that the collector reclaims; the base cache still
-    # owns whatever `prepare_coupled_cache` allocated.
+    # Extra bundles (orders other than the base) own their own device caches
+    # under Metal; host bundles are reclaimed by the collector. The base cache
+    # still owns whatever `prepare_coupled_cache` allocated.
+    if cache.base.bem_backend == :metal
+        for (order, bundle) in cache.quadrature_bundles
+            order == cache.base_quadrature_order && continue
+            release_metal_regular_assembly_cache!(bundle.device_cache)
+            release_metal_field_evaluation_cache!(bundle.field_cache)
+        end
+    end
     release_coupled_cache!(cache.base)
     return nothing
+end
+
+"""
+    _stage_overlap_enabled(bem_backend) -> Bool
+
+Whether to run the FEM static condensation concurrently with the BEM operator
+assembly inside `build_condensed_coupled_system`.
+
+The two stages are independent: the condensation reads `fem_system`, the
+interface operators and the retained vertex list, none of which the BEM assembly
+touches. Run in sequence, one processor idles for the other's duration — but
+that only costs anything when the two stages use *different* processors. On
+Metal the BEM assembly is on the GPU while the condensation is host UMFPACK, so
+overlapping hides the shorter stage. On `:cpu` both are host code competing for
+the same cores (the Schur complement already saturates them through
+`_blocked_umfpack_schur_complement`), so overlapping buys nothing there.
+Hence: Metal on, CPU off.
+
+`BLAB_COUPLED_STAGE_OVERLAP` overrides the default: `auto`, `on`, or `off`. A
+spawned condensation needs a thread of its own, so a single-threaded Julia
+always runs the stages in sequence.
+"""
+function _stage_overlap_enabled(bem_backend::Symbol)
+    requested = lowercase(strip(get(ENV, "BLAB_COUPLED_STAGE_OVERLAP", "auto")))
+    requested in ("auto", "on", "off") || error(
+        "Unsupported BLAB_COUPLED_STAGE_OVERLAP value: $requested. Expected auto, on, or off.",
+    )
+    requested == "off" && return false
+    Threads.nthreads() > 1 || return false
+    requested == "on" && return true
+    return bem_backend == :metal
 end
 
 """
@@ -579,8 +637,8 @@ function build_condensed_coupled_system(
     # The selected bundle's fields shadow the base cache's, so everything below reads the cache
     # exactly as it did before per-order quadrature existed.
     prepared = merge(condensed_cache.base, bundle)
-    prepared.bem_backend == :cpu ||
-        error("Condensed coupled cache must be built for the CPU BEM backend.")
+    prepared.bem_backend in (:cpu, :metal) ||
+        error("Condensed coupled cache must be built for the CPU or Metal BEM backend.")
     prepared.symmetry_mode == BeatEngineCore.normalized_symmetry_mode(symmetry_mode) ||
         error("Coupled cache symmetry mode does not match requested symmetry.")
     prepared.retained_fem_vertices == retained_fem_vertices ||
@@ -626,22 +684,59 @@ function build_condensed_coupled_system(
     prescribed_bem_count = size(bem_prescribed_neumann, 2)
     fem_system_s = (time_ns() - fem_stage_started) / 1.0e9
 
+    # Everything the condensation reads is final here and nothing below writes
+    # to it, so on Metal it runs on the host while the BEM operators assemble
+    # on the GPU. Started before the BEM stage rather than at its own marker
+    # below because the overlap is the whole point; `fem_condensation_s` then
+    # spans the concurrent region, and `stage_overlap` in the timings says so.
+    stage_overlap = _stage_overlap_enabled(prepared.bem_backend)
+    condensation_started = time_ns()
+    condensation_task = stage_overlap ? Threads.@spawn(_build_condensation(
+        fem_system,
+        interface_operators,
+        retained_fem_vertices;
+        schur_block_columns=schur_block_columns,
+    )) : nothing
+
     bem_operator_started = time_ns()
     # This solver's own fork of the CPU regular assembly, so it can be optimised without
     # touching the shared path every other backend runs through. Behaviourally identical to
     # `assemble_regular_galerkin_operators(...; backend=:cpu)`, pinned by an equivalence test.
-    operators = assemble_condensed_regular_operators(
-        bem_mesh,
-        prepared.p1,
-        prepared.dp0,
-        wavenumber,
-        prepared.rule;
-        skip_singular=false,
-        singular_order=singular_order,
-        singular_cache=prepared.singular_cache,
-        cpu_cache=prepared.cpu_assembly_cache,
-        symmetry_mode=prepared.symmetry_mode,
-    )
+    operators = if prepared.bem_backend == :metal
+        # Metal assembles the four operators on the GPU; the condensed algebra
+        # below is CPU-only, so bring them down and free the device copies.
+        device_operators = assemble_regular_galerkin_operators(
+            bem_mesh,
+            prepared.p1,
+            prepared.dp0,
+            wavenumber,
+            prepared.rule;
+            skip_singular=false,
+            singular_order=singular_order,
+            backend=:metal,
+            device_cache=prepared.device_cache,
+            singular_cache=prepared.singular_cache,
+            device_singular_cache=prepared.device_singular_cache,
+            symmetry_mode=prepared.symmetry_mode,
+        )
+        # Wraps shared device storage in place (copies it when the storage mode
+        # is private); either way the host tuple owns the device buffers, so
+        # `device_operators` must not be released separately.
+        metal_host_operators(device_operators)
+    else
+        assemble_condensed_regular_operators(
+            bem_mesh,
+            prepared.p1,
+            prepared.dp0,
+            wavenumber,
+            prepared.rule;
+            skip_singular=false,
+            singular_order=singular_order,
+            singular_cache=prepared.singular_cache,
+            cpu_cache=prepared.cpu_assembly_cache,
+            symmetry_mode=prepared.symmetry_mode,
+        )
+    end
     bem_operator_s = (time_ns() - bem_operator_started) / 1.0e9
 
     bem_matrix_started = time_ns()
@@ -651,6 +746,10 @@ function build_condensed_coupled_system(
         prepared.identity_p1_dp0,
         wavenumber,
     )
+    # `operators` is dead from here on and the matrices above are freshly
+    # allocated host arrays, so free the Metal buffers now rather than leaking
+    # one operator set per condensed frequency.
+    prepared.bem_backend == :metal && release_operator_storage!(operators)
     bem_interface_block = -(bem_rhs_operator * Complex{T}.(interface_operators.bem_flux))
     bem_motion_block = transducer_count == 0 ? nothing : -(bem_rhs_operator * bem_motion_flux)
     bem_prescribed_rhs = prescribed_bem_count == 0 ?
@@ -658,13 +757,25 @@ function build_condensed_coupled_system(
                          Complex{T}.(bem_rhs_operator * bem_prescribed_neumann)
     bem_matrix_s = (time_ns() - bem_matrix_started) / 1.0e9
 
-    condensation_started = time_ns()
-    condensation = _build_condensation(
-        fem_system,
-        interface_operators,
-        retained_fem_vertices;
-        schur_block_columns=schur_block_columns,
-    )
+    stage_overlap || (condensation_started = time_ns())
+    condensation = if isnothing(condensation_task)
+        _build_condensation(
+            fem_system,
+            interface_operators,
+            retained_fem_vertices;
+            schur_block_columns=schur_block_columns,
+        )
+    else
+        # `fetch` wraps a task failure in a TaskFailedException, which would
+        # make the error a caller sees depend on whether the stage happened to
+        # be overlapped. Rethrow the original instead.
+        try
+            fetch(condensation_task)
+        catch exception
+            exception isa TaskFailedException || rethrow()
+            rethrow(exception.task.result)
+        end
+    end
     fem_condensation_s = (time_ns() - condensation_started) / 1.0e9
 
     block_assembly_started = time_ns()
@@ -765,7 +876,7 @@ function build_condensed_coupled_system(
         bem_rhs_operator=nothing,
         prescribed_bem_rhs=bem_prescribed_rhs,
         prescribed_bem_neumann=bem_prescribed_neumann,
-        bem_backend=:cpu,
+        bem_backend=prepared.bem_backend,
         linear_backend=:cpu,
         symmetry_mode=prepared.symmetry_mode,
         cache=condensed_cache,
@@ -779,6 +890,9 @@ function build_condensed_coupled_system(
             bem_operator_s=bem_operator_s,
             bem_matrix_s=bem_matrix_s,
             fem_condensation_s=fem_condensation_s,
+            # True when `fem_condensation_s` and `bem_operator_s` cover the same
+            # wall-clock span and must not be added together.
+            stage_overlap=stage_overlap,
             block_assembly_s=block_assembly_s,
             coupled_factorization_s=coupled_factorization_s,
             replay_factorization_s=0.0,

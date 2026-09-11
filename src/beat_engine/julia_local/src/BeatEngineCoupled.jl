@@ -1063,8 +1063,8 @@ function prepare_coupled_cache(
     is_quadratic(fem_mesh) && error(
         "Quadratic tetrahedra are currently supported only by the pure interior FEM solve.",
     )
-    bem_backend in (:cpu, :cuda, :rocm) ||
-        error("Unsupported coupled BEM backend: $bem_backend. Expected :cpu, :cuda, or :rocm.")
+    bem_backend in (:cpu, :cuda, :rocm, :metal) ||
+        error("Unsupported coupled BEM backend: $bem_backend. Expected :cpu, :cuda, :rocm, or :metal.")
     resolve_coupled_bem_assembly(coupled_bem_assembly, bem_backend, false)
     normalized_symmetry = BeatEngineCore.normalized_symmetry_mode(symmetry_mode)
     validate_symmetry_fundamental_domain!(bem_mesh, normalized_symmetry)
@@ -1133,11 +1133,24 @@ function prepare_coupled_cache(
             singular_order=singular_order,
             symmetry_mode=normalized_symmetry,
         )
+    elseif bem_backend == :metal
+        # Metal assembles the BEM operators on the GPU and hands them to the CPU
+        # coupled algebra, so only the assembly, singular, and field caches live
+        # on the device; identity blocks and sparse FEM blocks stay on the host.
+        build_metal_regular_assembly_cache(
+            bem_mesh,
+            p1,
+            dp0,
+            rule;
+            singular_order=singular_order,
+            symmetry_mode=normalized_symmetry,
+        )
     else
         nothing
     end
     bem_backend == :cuda && BeatEngineCore.cuda_module().synchronize()
     bem_backend == :rocm && BeatEngineCore.amdgpu_module().synchronize()
+    bem_backend == :metal && BeatEngineCore.metal_module().synchronize()
     bem_device_regular_cache_s = (time_ns() - device_regular_started) / 1.0e9
 
     device_singular_started = time_ns()
@@ -1145,11 +1158,17 @@ function prepare_coupled_cache(
         BeatEngineCore.build_cuda_singular_correction_cache(singular_cache, p1, dp0)
     elseif bem_backend == :rocm
         build_rocm_singular_correction_cache(singular_cache)
+    elseif bem_backend == :metal
+        # Metal's host-staged assembly runs the singular correction on the CPU
+        # and rejects a native device cache, so only build one for :native.
+        BeatEngineCore._normalized_metal_assembly_mode(nothing) == :native ?
+        build_metal_singular_correction_cache(singular_cache) : nothing
     else
         nothing
     end
     bem_backend == :cuda && BeatEngineCore.cuda_module().synchronize()
     bem_backend == :rocm && BeatEngineCore.amdgpu_module().synchronize()
+    bem_backend == :metal && BeatEngineCore.metal_module().synchronize()
     bem_device_singular_cache_s = (time_ns() - device_singular_started) / 1.0e9
 
     device_image_started = time_ns()
@@ -1252,11 +1271,14 @@ function prepare_coupled_cache(
         build_cuda_field_evaluation_cache(cpu_field_cache)
     elseif bem_backend == :rocm
         build_rocm_field_evaluation_cache(cpu_field_cache)
+    elseif bem_backend == :metal
+        build_metal_field_evaluation_cache(cpu_field_cache)
     else
         cpu_field_cache
     end
     bem_backend == :cuda && BeatEngineCore.cuda_module().synchronize()
     bem_backend == :rocm && BeatEngineCore.amdgpu_module().synchronize()
+    bem_backend == :metal && BeatEngineCore.metal_module().synchronize()
     field_cache_s = (time_ns() - field_started) / 1.0e9
 
     return (
@@ -1311,6 +1333,12 @@ function _unsafe_free_cuda_fields!(value, fields)
 end
 
 function release_coupled_cache!(cache)
+    if cache.bem_backend == :metal
+        release_metal_regular_assembly_cache!(cache.device_cache)
+        release_metal_singular_correction_cache!(cache.device_singular_cache)
+        release_metal_field_evaluation_cache!(cache.field_cache)
+        return nothing
+    end
     if cache.bem_backend == :rocm
         release_rocm_regular_assembly_cache!(cache.device_cache)
         release_rocm_singular_correction_cache!(cache.device_singular_cache)
@@ -1762,11 +1790,11 @@ end
 const ROCM_HYBRID_SCHUR_BLOCK_SIZE = 64
 
 function _densify_sparse_columns!(
-    dense::AbstractMatrix{ComplexF64},
-    source::SparseMatrixCSC{ComplexF64,Int},
+    dense::AbstractMatrix{Complex{T}},
+    source::SparseMatrixCSC{Complex{T},Int},
     columns,
-)
-    fill!(dense, zero(ComplexF64))
+) where {T<:AbstractFloat}
+    fill!(dense, zero(Complex{T}))
     row_indices = rowvals(source)
     values = nonzeros(source)
     for (local_column, source_column) in enumerate(columns)
@@ -1777,9 +1805,47 @@ function _densify_sparse_columns!(
     return dense
 end
 
+"""
+    _schur_block_size_override() -> Union{Nothing,Int}
+
+`BLAB_SCHUR_BLOCK` pins the Schur right-hand-side block size, bypassing the
+balancing below. For measurement; unset in normal use.
+"""
+function _schur_block_size_override()
+    configured = strip(get(ENV, "BLAB_SCHUR_BLOCK", ""))
+    isempty(configured) && return nothing
+    parsed = tryparse(Int, configured)
+    (isnothing(parsed) || parsed <= 0) &&
+        error("BLAB_SCHUR_BLOCK must be a positive integer.")
+    return parsed
+end
+
+"""
+    _resolved_schur_block_size(requested, retained_count) -> Int
+
+Pick the right-hand-side block size for the Schur complement.
+
+`requested` is an upper bound, not a target. Blocks are handed to worker tasks
+round-robin and every block costs about the same, so what decides the stage's
+wall time is the *most* blocks any one task gets, not the average. Capping the
+size alone leaves that to chance: on `F2B_FLH` a 1,102-column interface at the
+64 cap gives 18 blocks over 8 threads, so two tasks take three blocks while six
+take two and then idle — the stage runs 3/2.25 = 33% longer than the work in it
+requires.
+
+So round the block *count* up to a whole multiple of the thread count and derive
+the size from that. The blocks get smaller than `requested` rather than larger,
+which is the safe direction: block width sets the dense right-hand-side buffer
+each task allocates.
+"""
 function _resolved_schur_block_size(requested::Int, retained_count::Int)
     retained_count == 0 && return 0
-    return max(1, min(requested, fld(retained_count, Threads.nthreads())))
+    override = _schur_block_size_override()
+    isnothing(override) || return max(1, min(override, retained_count))
+    thread_count = Threads.nthreads()
+    capped = max(1, min(requested, fld(retained_count, thread_count)))
+    balanced_count = cld(cld(retained_count, capped), thread_count) * thread_count
+    return max(1, cld(retained_count, balanced_count))
 end
 
 function _blocked_umfpack_schur_complement(
@@ -1795,12 +1861,23 @@ function _blocked_umfpack_schur_complement(
         schur=copy(retained_system),
         block_size=0,
         thread_count=1,
+        densify_s=0.0,
+        solve_s=0.0,
+        apply_s=0.0,
     )
 
     resolved_block_size = _resolved_schur_block_size(block_size, retained_count)
     block_starts = collect(1:resolved_block_size:retained_count)
     thread_count = max(1, min(Threads.nthreads(), length(block_starts)))
     schur = copy(retained_system)
+
+    # Per-stage totals summed across worker tasks, so they exceed the wall time of
+    # the stage by roughly `thread_count`. They are here to answer "which of the
+    # three steps dominates" before anyone tries to move one of them to a device;
+    # compare them against each other, not against `schur_extraction_s`.
+    densify_ns = Threads.Atomic{UInt64}(0)
+    solve_ns = Threads.Atomic{UInt64}(0)
+    apply_ns = Threads.Atomic{UInt64}(0)
 
     interior_count = size(interior_to_retained, 1)
     buffer_columns = min(resolved_block_size, retained_count)
@@ -1809,6 +1886,9 @@ function _blocked_umfpack_schur_complement(
             task_factorization = copy(factorization)
             dense_columns = Matrix{ComplexF64}(undef, interior_count, buffer_columns)
             solved_columns = Matrix{ComplexF64}(undef, interior_count, buffer_columns)
+            local_densify = UInt64(0)
+            local_solve = UInt64(0)
+            local_apply = UInt64(0)
             for block_index in task_index:thread_count:length(block_starts)
                 block_start = block_starts[block_index]
                 columns = block_start:min(
@@ -1817,8 +1897,13 @@ function _blocked_umfpack_schur_complement(
                 )
                 block_rhs = view(dense_columns, :, 1:length(columns))
                 block_solution = view(solved_columns, :, 1:length(columns))
+                mark = time_ns()
                 _densify_sparse_columns!(block_rhs, interior_to_retained, columns)
+                local_densify += time_ns() - mark
+                mark = time_ns()
                 ldiv!(block_solution, task_factorization, block_rhs)
+                local_solve += time_ns() - mark
+                mark = time_ns()
                 mul!(
                     view(schur, :, columns),
                     retained_to_interior,
@@ -1826,7 +1911,11 @@ function _blocked_umfpack_schur_complement(
                     -one(ComplexF64),
                     one(ComplexF64),
                 )
+                local_apply += time_ns() - mark
             end
+            Threads.atomic_add!(densify_ns, local_densify)
+            Threads.atomic_add!(solve_ns, local_solve)
+            Threads.atomic_add!(apply_ns, local_apply)
         end
     end
     foreach(wait, tasks)
@@ -1834,6 +1923,9 @@ function _blocked_umfpack_schur_complement(
         schur=schur,
         block_size=resolved_block_size,
         thread_count=thread_count,
+        densify_s=densify_ns[] / 1.0e9,
+        solve_s=solve_ns[] / 1.0e9,
+        apply_s=apply_ns[] / 1.0e9,
     )
 end
 
@@ -1878,6 +1970,9 @@ function _build_rocm_hybrid_fem_condensation(
             schur=retained_system,
             block_size=0,
             thread_count=1,
+            densify_s=0.0,
+            solve_s=0.0,
+            apply_s=0.0,
         )
     else
         _blocked_umfpack_schur_complement(
@@ -1910,6 +2005,9 @@ function _build_rocm_hybrid_fem_condensation(
             partition_s=partition_s,
             factorization_s=factorization_s,
             schur_extraction_s=schur_extraction_s,
+            schur_densify_s=schur_result.densify_s,
+            schur_solve_s=schur_result.solve_s,
+            schur_apply_s=schur_result.apply_s,
             upload_s=upload_s,
         ),
     )
@@ -2056,10 +2154,17 @@ function build_coupled_system(
         device_cache=prepared.device_cache,
         device_image_singular_cache=prepared.device_image_singular_cache,
         symmetry_mode=prepared.symmetry_mode,
-        return_device=bem_backend in (:cuda, :rocm),
-        accelerator_quadrature=bem_backend in (:cuda, :rocm),
+        return_device=bem_backend in (:cuda, :rocm, :metal),
+        accelerator_quadrature=bem_backend in (:cuda, :rocm, :metal),
         device_singular_cache=prepared.device_singular_cache,
     )
+    if bem_backend == :metal
+        # The coupled algebra below runs on the CPU for Metal (no GPU LU), so
+        # present the four operators to the host: shared storage is wrapped in
+        # place, private storage is copied. Either way the host tuple owns the
+        # device buffers, so releasing it releases them.
+        operators = metal_host_operators(operators)
+    end
     bem_operator_s = (time_ns() - bem_operator_started) / 1.0e9
     bem_matrix_started = time_ns()
     linear_backend = bem_backend in (:cuda, :rocm) && !validation_diagnostics ?
@@ -2117,6 +2222,10 @@ function build_coupled_system(
             prepared.identity_p1_dp0,
             wavenumber,
         )
+        # `operators` is dead from here on, and the two matrices above are
+        # freshly allocated host arrays. Free the Metal buffers now instead of
+        # leaking an operator set per coupled frequency.
+        bem_backend == :metal && release_operator_storage!(operators)
         (
             bem_lhs=bem_lhs,
             bem_rhs_operator=bem_rhs_operator,
