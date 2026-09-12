@@ -1,4 +1,6 @@
 import json
+import tomllib
+from pathlib import Path
 
 import pytest
 
@@ -13,6 +15,11 @@ def test_public_paths_resolve_packaged_assets(backend):
     assert paths.source_solver.is_file()
     info = json.loads((paths.root / "beat_contract/worker-v1.json").read_text())
     assert info["engine"]["version"] == __version__
+
+
+def test_package_version_matches_pyproject():
+    pyproject = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text())
+    assert pyproject["project"]["version"] == __version__
 
 
 def test_unsupported_backend_does_not_fall_back():
